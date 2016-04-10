@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include "contracts.h"
 #include "mm.h"
 #include "memlib.h"
 
@@ -42,6 +42,8 @@
 #define WSIZE       4       /* Word and header/footer size (bytes) */
 #define DSIZE       8       /* Doubleword size (bytes) */
 #define CHUNKSIZE  (1<<12)  /* Extend heap by this amount (bytes) */
+#define MINIMUM     24      /* Minimum Size of block */
+#define VERBOSE     1       /* Debugging Purposes*/
 
 #define MAX(x, y) ((x) > (y)? (x) : (y))
 
@@ -63,19 +65,15 @@
 /* Given block ptr ptr, compute address of next and previous blocks */
 #define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(((char *)(ptr) - WSIZE)))
 #define PREV_BLKP(ptr)  ((char *)(ptr) - GET_SIZE(((char *)(ptr) - DSIZE)))
-#define PUTNEXTFREEP(p, val)  (*(unsigned int *)(p) = (val))
-#define PUTPREVFREEP(p, val)  (*((unsigned int *)(p) + WSIZE) = (val))
-#define GETNEXTFREEP(p) (*(unsigned int *)(p))
-#define GETPREVFREEP(p) (*((unsigned int *)(p) + WSIZE))
+#define PUTNEXTFREEP(p, val)  (*(unsigned long *)(p) = (val))
+#define PUTPREVFREEP(p, val)  (*((unsigned long *)(p) + DSIZE) = (val))
+#define GETNEXTFREEP(p) (*(unsigned long *)(p))
+#define GETPREVFREEP(p) (*((unsigned long *)(p) + DSIZE))
 
 /* Global variables */
 static char *heap_listp = 0;  /* Pointer to first block */
 static int *freeListStartp = 0;
 static int *freeListEndp = 0;
-
-#ifdef NEXT_FIT
-static char *rover;           /* Next fit rover */
-#endif
 
 /* Function prototypes for internal helper routines */
 static void *extend_heap(size_t words);
@@ -85,13 +83,21 @@ static void *coalesce(void *ptr);
 static void printblock(void *ptr);
 static void checkheap(int verbose);
 static void checkblock(void *ptr);
-void fixFreeList( void *ptr);
+static void fixFreeList( void *ptr);
+static void removeFreeBlock(void *ptr);
+static void putFirstFreeBlock(void *ptr);
+static void checkFreeList(int lineno);
+void *getLastFreep(void * ptr);
 
 
 /*
  * Initialize: return -1 on error, 0 on success.
  */
 int mm_init(void) {
+
+    if (VERBOSE){
+        printf("Initializing Heap!\n");
+    }
      /* Create the initial empty heap */
     if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) //line:vm:mm:begininit
         return -1;
@@ -100,15 +106,14 @@ int mm_init(void) {
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /* Prologue footer */
     PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* Epilogue header */
     heap_listp += (2*WSIZE);
-
     void *ptr;
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if ((ptr = extend_heap(CHUNKSIZE/WSIZE)) == NULL)
         return -1;
-    freeListStartp = (int *)ptr;
-    freeListEndp = (int *)NEXT_BLKP(ptr);
-    PUTNEXTFREEP(freeListStartp, freeListEndp);
-    PUTPREVFREEP(freeListStartp, PREV_BLKP(freeListStartp));
+    // freeListStartp = (int *)ptr;
+    // freeListEndp = (int *)NEXT_BLKP(ptr);
+    // PUTNEXTFREEP(freeListStartp, (long)freeListEndp);
+    // PUTPREVFREEP(freeListStartp, (long)PREV_BLKP(freeListStartp));
     return 0;
 }
 
@@ -117,6 +122,10 @@ void *malloc (size_t size) {
     size_t asize;      /* Adjusted block size */
     size_t extendsize; /* Amount to extend heap if no fit */
     char *ptr;
+
+    if (VERBOSE) {
+        printf("\nCalled Malloc on size %d\n", (unsigned int)size);
+    }
 
     if (heap_listp == 0){
        mm_init();
@@ -131,40 +140,88 @@ void *malloc (size_t size) {
         asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
 
     /* Search the free list for a fit */
+    asize = MAX(asize, MINIMUM);
     if ((ptr = find_fit(asize)) != NULL) {
         place(ptr, asize);
+        if (VERBOSE){
+            printf("\nExited Malloc with ptr %p\n\n\n", ptr);
+        }
         return ptr;
     }
-
+    if (VERBOSE){
+        printf("Did not Find Fit - Extending size\n");
+    }
     /* No fit found. Get more memory and place the block */
     extendsize = MAX(asize,CHUNKSIZE);
     if ((ptr = extend_heap(extendsize/WSIZE)) == NULL)
         return NULL;
+    if (VERBOSE){
+        printf("Extended the heap by %d bytes and got ptr :%p\n",(int) extendsize, ptr);
+    }
     fixFreeList((void *)ptr);
     place(ptr, asize);
+    if (VERBOSE){
+            printf("\nExited Malloc with ptr %p\n\n\n", ptr);
+        }
     return ptr;
 }
 
-void fixFreeList( void *ptr) {
-    int *freep;
+static void fixFreeList( void *ptr) {
+    int *freep, *oldFreeListStartp, *oldFreeListPrevp, *oldFreeListNextp;
+    int * oldFreeListEnd;
     void *epilogue; 
-    epilogue = NEXT_BLKP(ptr);
-    for(freep = (int *) ptr; GETNEXTFREEP(freep) != freeListEndp; freep = GETNEXTFREEP(freep))
+    if (VERBOSE)
     {
-        //Do nothing
+        printf("\nCalled fixFreeList on ptr: %p\n", ptr);
     }
-    PUTNEXTFREEP(freep, epilogue);
-    freeListEndp = (int *)epilogue;
-    PUTPREVFREEP(freeListStartp, ptr);
-    PUTNEXTFREEP(ptr, freeListStartp);
-    PUTPREVFREEP(ptr, heap_listp);
+    if (freeListStartp == 0){
+        return;
+    }
+    // if ((int *)getLastFreep(ptr) == freeListEndp){
+    //     return;
+    // }
+    
+    epilogue = NEXT_BLKP(ptr);
+
+    oldFreeListEnd = freeListEndp;
+
+    oldFreeListStartp = (int *)freeListStartp;
+    oldFreeListPrevp = (int *)GETPREVFREEP(freeListStartp);
+    oldFreeListNextp = (int *)GETNEXTFREEP(freeListStartp);
+
     freeListStartp = (int *)ptr;
+    freeListEndp = (int *)epilogue;
+
+    PUTNEXTFREEP(freeListStartp, (long)oldFreeListStartp);
+    PUTPREVFREEP(freeListStartp, (long)oldFreeListPrevp);
+
+    if (oldFreeListStartp == oldFreeListNextp){
+        return;
+    }
+
+    if (VERBOSE)
+    {
+        printf("Right Before the loop\n");
+    }
+    for(freep = (int *)oldFreeListStartp; (int*)GETNEXTFREEP(freep) != oldFreeListEnd; freep = (int *)GETNEXTFREEP(freep))
+    {
+        // printf("current free ptr :%p\n", freep);
+        // printf("next ptr is ptr %p:\n", (int*)GETNEXTFREEP(freep));
+    }
+    if (VERBOSE)
+    {
+        printf("rIGHT AFTER THE LOOP\n");
+    }
+    PUTNEXTFREEP(freep, (long)epilogue);
+    PUTPREVFREEP(oldFreeListStartp, (long)ptr);
     return;
 }
 
 
 void free (void *ptr) {
-
+    if (VERBOSE) {
+        printf("\nCalled free on ptr %p\n", ptr);
+    }
     if(!ptr) return;
     if(ptr == 0) return;
 
@@ -177,9 +234,10 @@ void free (void *ptr) {
 
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
-    PUTPREVFREEP(ptr,GETPREVFREEP(freeListStartp));
-    PUTPREVFREEP(freeListStartp, ptr);
-    PUTNEXTFREEP(ptr, freeListStartp);
+
+    PUTPREVFREEP(ptr,(long)GETPREVFREEP(freeListStartp));
+    PUTPREVFREEP(freeListStartp, (long)ptr);
+    PUTNEXTFREEP(ptr, (long)freeListStartp);
     freeListStartp = (int *)ptr;
     coalesce(ptr);
 }
@@ -191,39 +249,123 @@ static void *coalesce(void *ptr)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     size_t size = GET_SIZE(HDRP(ptr));
 
+    if (VERBOSE)
+    {
+        printf("\nCalled Coalesce on ptr : %p\n", ptr);
+    }
     if (prev_alloc && next_alloc) {            /* Case 1 */
-    return ptr;
+        if (VERBOSE)
+        {
+            printf("Case 1\n");
+        }
+        return ptr;
     }
 
     else if (prev_alloc && !next_alloc) {      /* Case 2 */
-    size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-    PUT(HDRP(ptr), PACK(size, 0));
-    PUT(FTRP(ptr), PACK(size,0));
+        if (VERBOSE)
+        {
+            printf("Case 2\n");
+        }
+        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+        removeFreeBlock(NEXT_BLKP(ptr));
+        PUT(HDRP(ptr), PACK(size, 0));
+        PUT(FTRP(ptr), PACK(size,0));
+        putFirstFreeBlock(ptr);
     }
 
     else if (!prev_alloc && next_alloc) {      /* Case 3 */
-    size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
-    PUT(FTRP(ptr), PACK(size, 0));
-    PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
-    ptr = PREV_BLKP(ptr);
+        if (VERBOSE)
+        {
+            printf("Case 3\n");
+        }
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
+        printf("next block : %p\n", (int *)GETNEXTFREEP(ptr));
+        removeFreeBlock(ptr);
+        PUT(FTRP(ptr), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+
+        ptr = PREV_BLKP(ptr);
+        putFirstFreeBlock(ptr);
     }
 
     else {                                     /* Case 4 */
-    size += GET_SIZE(HDRP(PREV_BLKP(ptr))) +
-        GET_SIZE(FTRP(NEXT_BLKP(ptr)));
-    PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
-    PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
-    ptr = PREV_BLKP(ptr);
+        if (VERBOSE)
+        {
+            printf("Case 4\n");
+        }
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr))) +
+            GET_SIZE(FTRP(NEXT_BLKP(ptr)));
+        removeFreeBlock(NEXT_BLKP(ptr));
+        removeFreeBlock(PREV_BLKP(ptr));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
+        ptr = PREV_BLKP(ptr);
+        putFirstFreeBlock(ptr);
     }
 
-#ifdef NEXT_FIT
-    /* Make sure the rover isn't pointing into the free block */
-    /* that we just coalesced */
-    if ((rover > (char *)ptr) && (rover < NEXT_BLKP(ptr)))
-    rover = ptr;
-#endif
-
     return ptr;
+}
+
+static void removeFreeBlock(void *ptr) {
+    int *prev;
+    int *next;
+    if (VERBOSE)
+    {
+        printf("\nEntered removeFreeBlock- Removing ptr : %p\n", ptr);
+    }
+
+
+    prev = (int *)GETPREVFREEP(ptr);
+    next = (int *)GETNEXTFREEP(ptr);
+    if (prev != (int*)heap_listp)
+    {
+        PUTNEXTFREEP(prev,(long)next);
+    }
+    if (next != freeListEndp)
+    {
+    PUTPREVFREEP(next, (long)prev);
+    }
+    if ((int *)ptr == oldFreeListStartp){
+        freeListStartp = next;
+    }
+    printf("freeListStartp: %p, freeListEndp: %p\n", freeListStartp, freeListEndp);
+    return;
+}
+
+
+static void putFirstFreeBlock(void *ptr){
+    if (VERBOSE)
+    {
+        printf("\nEntered putFirstFreeBlock - Inserting : %p\n",ptr);
+    }
+    if (freeListStartp == 0)
+    {
+        freeListStartp = (int *)ptr;
+        freeListEndp = (int *)NEXT_BLKP(ptr);
+        PUTNEXTFREEP(freeListStartp, (long)freeListEndp);
+        PUTPREVFREEP(freeListStartp, (long)PREV_BLKP(freeListStartp));
+        return;
+    }
+    if ((int *)ptr == freeListStartp)
+    {
+        printf("No Need to fix\n");
+        return;
+    } 
+    printf("freeListStartp %p\n", freeListStartp);
+    printf("freeListEndp %p\n", freeListEndp);
+    if (freeListStartp != freeListEndp){
+        PUTPREVFREEP(freeListStartp, (long)ptr);
+    }
+    printf("next prev ptr : %p\n", (int*)GETPREVFREEP(freeListStartp));
+    printf("next next ptr %p\n",(int *)GETNEXTFREEP(freeListStartp) );
+    PUTNEXTFREEP(ptr, (long)freeListStartp);
+    PUTPREVFREEP(ptr, (long)heap_listp);
+    
+    freeListStartp = (int *)ptr;
+
+    printf("freeListStartp: %p\n", freeListStartp);
+    printf("freeListEndp: %p\n", freeListEndp);
+    return;
 }
 
 /*
@@ -232,6 +374,9 @@ static void *coalesce(void *ptr)
 void *realloc(void *ptr, size_t size) {
     size_t oldsize;
     void *newptr;
+    if (VERBOSE){
+        printf("Called Realloc on ptr %p to size %d\n", ptr, (unsigned int)size);
+    }
 
     /* If size == 0 then this is just free, and we return NULL. */
     if(size == 0) {
@@ -292,6 +437,60 @@ static int aligned(const void *p) {
  * mm_checkheap
  */
 void mm_checkheap(int lineno) {
+    checkheap(lineno);
+    checkFreeList(lineno);
+}
+
+void checkFreeList(int lineno) {
+    
+    int *ptr = freeListStartp;
+
+    if (ptr == 0){
+        printf("No Free list Created yet\n");
+        return;
+    }
+
+    if (VERBOSE)
+    {
+        printf("Checking Free List .... (%p):\n", freeListStartp);
+    }   
+
+    if (freeListStartp == freeListEndp){
+        printf(" There is no Freelist .. .\n");
+        printf("Passed!!\n");
+        return;
+    }
+
+    printf("CHecking Header Pointer...\n");
+    if (GET_ALLOC(HDRP(freeListStartp)) || ((int *)GETPREVFREEP(ptr) != (int *)heap_listp))
+    {
+        printf("Bad free list Start header / alloc and prev \n");
+    }
+    checkblock(freeListStartp);
+    if(GET_ALLOC(HDRP(GETNEXTFREEP(freeListStartp)))){
+        REQUIRES(GETNEXTFREEP(freeListStartp) == freeListEndp);
+        REQUIRES(GET_SIZE(HDRP(freeListEndp)) == 0);
+        printf("There is only One free block . . .Passed!!\n");
+        return;
+    }
+
+    printf("Checking Free list\n");
+    printf("ptr : %p and freeListEndp : %p\n",ptr, freeListEndp );
+    for (ptr = freeListStartp; (int *)ptr != freeListEndp; ptr = (int *)GETNEXTFREEP(ptr)) {
+        if (ptr == (int *)GETNEXTFREEP(ptr)){
+            printf("ERROR Infinite Loop: ptr %p, next:%p, End of List: %p\n",ptr, (int *)GETNEXTFREEP(ptr), freeListEndp );
+            exit(1);
+        }
+        printf("ptr: %p, next ptr: %p\n",ptr, (int*)GETNEXTFREEP(ptr) );
+        checkblock(ptr);
+    }
+    
+    printf("DOne CHecking Free list\n");
+    // if (verbose)
+    //    printblock(ptr);
+
+    if ((GET_SIZE(HDRP(ptr)) != 0) || !(GET_ALLOC(HDRP(ptr))))
+        printf("Bad Free List End\n"); 
 }
 
 static void *extend_heap(size_t words)
@@ -299,6 +498,10 @@ static void *extend_heap(size_t words)
     char *ptr;
     size_t size;
 
+    if (VERBOSE)
+    {
+        printf("Called Extend Heap\n");
+    }
     /* Allocate an even number of words to maintain alignment */
     size = (words % 2) ? (words+1) * WSIZE : words * WSIZE;
     if ((long)(ptr = mem_sbrk(size)) == -1)
@@ -308,9 +511,12 @@ static void *extend_heap(size_t words)
     PUT(HDRP(ptr), PACK(size, 0));         /* Free block header */
     PUT(FTRP(ptr), PACK(size, 0));         /* Free block footer */
     PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); /* New epilogue header */
-
+    fixFreeList(ptr);
+    putFirstFreeBlock(ptr);
     /* Coalesce if the previous block was free */
+
     return coalesce(ptr);
+
 }
 
 /*
@@ -319,28 +525,41 @@ static void *extend_heap(size_t words)
  */
 static void place(void *ptr, size_t asize)
 {
+    if (VERBOSE){
+        printf("\nCalled Place: %d block in ptr %p\n",(int)asize, ptr);
+    }
     size_t csize = GET_SIZE(HDRP(ptr));
+
+    if (VERBOSE){
+        printf("Size of free block is %d\n", (int)csize);
+    }
     int * prevFree;
     int * nextFree;
-    if ((csize - asize) >= (2*DSIZE)) {
+
+    if ((csize - asize) >= (MINIMUM)) {
         //Shrinks the current block
-        prevFree = GETPREVFREEP(ptr);
-        nextFree = GETNEXTFREEP(ptr);
+        prevFree = (int *)GETPREVFREEP(ptr);
+        nextFree = (int *)GETNEXTFREEP(ptr);
+
         PUT(HDRP(ptr), PACK(asize, 1));
         PUT(FTRP(ptr), PACK(asize, 1));
+
         ptr = NEXT_BLKP(ptr);
         PUT(HDRP(ptr), PACK(csize-asize, 0));
         PUT(FTRP(ptr), PACK(csize-asize, 0));
-        PUTNEXTFREEP(ptr, nextFree);
-        PUTPREVFREEP(ptr, prevFree);
+
+        PUTNEXTFREEP(ptr, (long)nextFree);
+        PUTPREVFREEP(ptr, (long)prevFree);
+        freeListStartp = ptr;
     }
     else {
-        prevFree = GETPREVFREEP(ptr);
-        nextFree = GETPREVFREEP(ptr);
-        PUTNEXTFREEP(prevFree, nextFree);
-        PUTPREVFREEP(nextFree, prevFree);
+        prevFree = (int *)GETPREVFREEP(ptr);
+        nextFree = (int *)GETNEXTFREEP(ptr);
+
+        PUTPREVFREEP(nextFree, (long)prevFree);
         PUT(HDRP(ptr), PACK(csize, 1));
         PUT(FTRP(ptr), PACK(csize, 1));
+        freeListStartp = nextFree;
     }
 }
 
@@ -351,8 +570,10 @@ static void *find_fit(size_t asize)
 {
     /* First fit search */
     void *ptr;
-
-    for (ptr = (void *)freeListStartp; !GET_ALLOC(PTR) ; ptr = (void *)GETNEXTFREEP(ptr) ) {
+    if (VERBOSE){
+        printf("\nCalled find_Fit for size %d\n",(int)asize);
+    }
+    for (ptr = (void *)freeListStartp; !GET_ALLOC(HDRP(ptr)) ; ptr = (void *)GETNEXTFREEP(ptr) ) {
         if (!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
             return ptr;
         }
@@ -360,40 +581,6 @@ static void *find_fit(size_t asize)
     return NULL;
 }
 
-
-// /*
-//  * find_fit - Find a fit for a block with asize bytes
-//  */
-// static void *find_fit(size_t asize)
-// {
-
-// #ifdef NEXT_FIT
-//     /* Next fit search */
-//     char *oldrover = rover;
-
-//     /* Search from the rover to the end of list */
-//     for ( ; GET_SIZE(HDRP(rover)) > 0; rover = NEXT_BLKP(rover))
-//     if (!GET_ALLOC(HDRP(rover)) && (asize <= GET_SIZE(HDRP(rover))))
-//         return rover;
-
-//     /* search from start of list to old rover */
-//     for (rover = heap_listp; rover < oldrover; rover = NEXT_BLKP(rover))
-//     if (!GET_ALLOC(HDRP(rover)) && (asize <= GET_SIZE(HDRP(rover))))
-//         return rover;
-
-//     return NULL;  /* no fit found */
-// #else
-//     /* First fit search */
-//     void *ptr;
-
-//     for (ptr = heap_listp; GET_SIZE(HDRP(ptr)) > 0; ptr = NEXT_BLKP(ptr)) {
-//         if (!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
-//             return ptr;
-//         }
-//     }
-//     return NULL;
-// #endif
-// }
 
 static void printblock(void *ptr)
 {
@@ -428,23 +615,33 @@ static void checkblock(void *ptr)
  */
 void checkheap(int verbose)
 {
+    int lineno = verbose;
     char *ptr = heap_listp;
-
     if (verbose)
-    printf("Heap (%p):\n", heap_listp);
+    {
+        printf("\nHeap (%p):\n", heap_listp);
+        printf("Called on Lineno %d\n",lineno);
+    }   
+
 
     if ((GET_SIZE(HDRP(heap_listp)) != DSIZE) || !GET_ALLOC(HDRP(heap_listp)))
        printf("Bad prologue header\n");
+   if (VERBOSE){
+    printf("Checking headlistp . . . ");
+   }
     checkblock(heap_listp);
-
+   if (VERBOSE){
+    printf("Finished headlistp\n");
+   } 
     for (ptr = heap_listp; GET_SIZE(HDRP(ptr)) > 0; ptr = NEXT_BLKP(ptr)) {
-        if (verbose)
-            printblock(ptr);
+        if(VERBOSE) {
+            printf("Checking Block ptr: %p\n", ptr);
+        }
         checkblock(ptr);
     }
 
-    if (verbose)
-       printblock(ptr);
+    // if (verbose)
+    //    printblock(ptr);
     if ((GET_SIZE(HDRP(ptr)) != 0) || !(GET_ALLOC(HDRP(ptr))))
        printf("Bad epilogue header\n");
 }

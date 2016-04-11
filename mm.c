@@ -1,14 +1,19 @@
 /*
  * mm.c
  * Leonardo Cervantes Lcervant
- * NOTE TO STUDENTS: Replace this header comment with your own header
+ * Segragated List Implementation of Malloc package Using Doubly-linked list
+ * THis uses "Buckets" as way for storing block pointers of a certain length 
+ * so that way malloc can always know where to look for a block. This malloc 
+ * package uses 20 buckets and has a Chunk size of 1<<7. :D
+ * The buckets themselves are store in a 2d array that is kept in a global 
+ * variable segListp.
+ * All If statements with VERBOSE are for debugging purposes only!
  */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "contracts.h"
 #include "mm.h"
 #include "memlib.h"
 
@@ -39,9 +44,10 @@
 /* Basic constants and macros */
 #define WSIZE       4       /* Word and header/footer size (bytes) */
 #define DSIZE       8       /* Doubleword size (bytes) */
-#define CHUNKSIZE  (1<<12)  /* Extend heap by this amount (bytes) */
+#define CHUNKSIZE  (1<<7)   /* Extend heap by this amount (bytes) */
 #define MINIMUM     24      /* Minimum Size of block */
-#define VERBOSE     1       /* Debugging Purposes*/
+#define VERBOSE     0       /* For Debugging*/
+#define BUCKETS     20      /* Buckets where we store the point*/
 
 #define MAX(x, y) ((x) > (y)? (x) : (y))
 
@@ -63,15 +69,15 @@
 /* Given block ptr ptr, compute address of next and previous blocks */
 #define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(((char *)(ptr) - WSIZE)))
 #define PREV_BLKP(ptr)  ((char *)(ptr) - GET_SIZE(((char *)(ptr) - DSIZE)))
-#define PUTNEXTFREEP(p, val)  (*(unsigned long *)(p) = (val))
-#define PUTPREVFREEP(p, val)  (*((unsigned long *)(p) + DSIZE) = (val))
-#define GETNEXTFREEP(p) (*(unsigned long *)(p))
-#define GETPREVFREEP(p) (*((unsigned long *)(p) + DSIZE))
+#define PUTNEXTFREEP(p, val)  (*(void **)(p + DSIZE) = val)
+#define PUTPREVFREEP(p, val)  (*(void **)p = val)
+#define GETNEXTFREEP(p) (*(void **)(p+ DSIZE))
+#define GETPREVFREEP(p) (*(void **)p)
+
 
 /* Global variables */
 static char *heap_listp = 0;  /* Pointer to first block */
-static int *freeListStartp = 0;
-static int *freeListEndp = 0;
+static void *segListp = 0;
 
 /* Function prototypes for internal helper routines */
 static void *extend_heap(size_t words);
@@ -79,42 +85,65 @@ static void place(void *ptr, size_t asize);
 static void *find_fit(size_t asize);
 static void *coalesce(void *ptr);
 static void printblock(void *ptr);
-static void checkheap(int verbose);
+static void checkheap(int lineno);
 static void checkblock(void *ptr);
 static void removeFreeBlock(void *ptr);
-static void putFirstFreeBlock(void *ptr);
+static void *putFirstFreeBlock(void *ptr);
 static void checkFreeList(int lineno);
-void *getLastFreep(void * ptr);
+static int getBucketSize(unsigned int size);
+void packagePtr(void *ptr, size_t size, unsigned int alloc);
 
 
 /*
  * Initialize: return -1 on error, 0 on success.
+ * Allocate enough space to store an adress in all the buckets as 
+ * as out prolouge and epilougue. Malloc will start putting all 
+ * fallocated and free blocks after the initial adresses of the 
+ * buckets. Th extend_heap Function increases the heap past just
+ * the bucket pointers and makes room for actual blocks
  */
 int mm_init(void) {
+
+    void *ptr;
+    void **bucketList;
+    int bucketSize;
 
     if (VERBOSE){
         printf("Initializing Heap!\n");
     }
-     /* Create the initial empty heap */
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) //line:vm:mm:begininit
+    if ((segListp = mem_sbrk((BUCKETS * DSIZE) + 2*DSIZE)) == (void *)-1)
         return -1;
+    heap_listp = (BUCKETS * DSIZE) + (char *)segListp;
+
+    bucketList = (void **)segListp;
+    for (bucketSize = 0; bucketSize < BUCKETS; bucketSize++){
+        bucketList[bucketSize] = NULL;
+    }
+
+    /* Create the initial empty heap */
+
     PUT(heap_listp, 0);                          /* Alignment padding */
     PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1)); /* Prologue header */
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /* Prologue footer */
     PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* Epilogue header */
     heap_listp += (2*WSIZE);
-    void *ptr;
+    
+    
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if ((ptr = extend_heap(CHUNKSIZE/WSIZE)) == NULL)
         return -1;
-    freeListStartp = (int *)ptr;
-    freeListEndp = 0;
-    PUTNEXTFREEP(freeListStartp, (long)freeListEndp);
-    PUTPREVFREEP(freeListStartp, 0);
     return 0;
 }
 
-
+/*  Malloc - Takes a positive integer and returns a double aligned block that
+ *  that is at least 24 bytes, If there is no heap , we initialize it and if 
+ *  the requested block length is zero is is ignored. We then determine the 
+ *  amount of block size that we need and look for it in free list using 
+ *  find_fit. If there is a a block with the requireds size we return a 
+ *  pointer and then allocate it using place. If there is not free block found 
+ *  then we extend the heap and and place it to the appropriate pointer
+ *
+ */
 void *malloc (size_t size) {
     size_t asize;      /* Adjusted block size */
     size_t extendsize; /* Amount to extend heap if no fit */
@@ -122,8 +151,9 @@ void *malloc (size_t size) {
 
     if (VERBOSE) {
         printf("\nCalled Malloc on size %d\n", (unsigned int)size);
+        mm_checkheap(135);
     }
-    mm_checkheap(128);
+    
     if (heap_listp == 0){
        mm_init();
     }
@@ -162,42 +192,41 @@ void *malloc (size_t size) {
     return ptr;
 }
 
+/* packagePtr - Used to pack the footer and header of a pointer
+ */
+void packagePtr(void *ptr, size_t size, unsigned int alloc)
+{
+    PUT(HDRP(ptr), PACK(size, alloc));
+    PUT(FTRP(ptr), PACK(size, alloc));
+}
+
+/* free - When called, we un-allocated the pointer and then add it to the
+ * begging of our buckets
+ */
 void free (void *ptr) {
     if (VERBOSE) {
         printf("\nCalled free on ptr %p\n", ptr);
+        mm_checkheap(181);
     }
-    mm_checkheap(171);
+    
     if(!ptr) return;
-    if(ptr == 0) return;
-
     size_t size = GET_SIZE(HDRP(ptr));
+    size_t alloc = 0;
 
     if (heap_listp == 0){
        mm_init();
     }
 
-
-    PUT(HDRP(ptr), PACK(size, 0));
-    PUT(FTRP(ptr), PACK(size, 0));
-    // if (freeListStartp){
-
-    //     PUTNEXTFREEP(ptr,(long)freeListStartp);
-    //     PUTPREVFREEP(freeListStartp, (long)ptr); 
-    // } else{
-    //     PUTNEXTFREEP(ptr, 0);
-    // }
-    // PUTPREVFREEP(ptr, 0);
-    // freeListStartp = (int *)ptr;
-    // mm_checkheap(193);
-    // putFirstFreeBlock(ptr);
-    // mm_checkheap(194);
-    coalesce(ptr);
-    mm_checkheap(195);
+    packagePtr((void *)ptr, size, alloc);
+    putFirstFreeBlock(ptr);
 }
 
 /*
  * place - Place block of asize bytes at start of free block ptr
  *         and split if remainder would be at least minimum block size
+ * We always removed the block pointer from our buckets but is we split
+ * up the block then the leftover block is put at the beginning of its 
+ * repective bucket
  */
 static void place(void *ptr, size_t asize)
 {
@@ -209,72 +238,72 @@ static void place(void *ptr, size_t asize)
     if (VERBOSE){
         printf("Size of free block is %d\n", (int)csize);
     }
-    // int * prevFree;
-    // int * nextFree;
-    int * newptr;
+
+    removeFreeBlock(ptr);
 
     if ((csize - asize) >= (MINIMUM)) {
-        //Shrinks the current block
-        // prevFree = (int *)GETPREVFREEP(ptr);
-        // nextFree = (int *)GETNEXTFREEP(ptr);
-
-        PUT(HDRP(ptr), PACK(asize, 1));
-        PUT(FTRP(ptr), PACK(asize, 1));
-        removeFreeBlock(ptr);
-        newptr = (int *)NEXT_BLKP(ptr);
-        PUT(HDRP(newptr), PACK(csize-asize, 0));
-        PUT(FTRP(newptr), PACK(csize-asize, 0));
-        // putFirstFreeBlock(newptr);
-        coalesce(newptr);
-
-        // PUTNEXTFREEP(newptr, (long)nextFree);
-        // PUTPREVFREEP(newptr, (long)prevFree);
-        // if ((int *)ptr == freeListStartp){
-        //     freeListStartp = newptr;
-        // }
-        // if (prevFree){
-        //     PUTNEXTFREEP(prevFree, (long)newptr);
-        // }
-        // if (nextFree){
-        //     PUTPREVFREEP(nextFree, (long)newptr);
-        // }
+        /* Split the block since there is atleast 24 Bytes of unused space */
+        packagePtr((void *)ptr, asize, 1);
+        ptr = (int *)NEXT_BLKP(ptr);
+        packagePtr((void *)ptr, (csize-asize), 0);
+        putFirstFreeBlock(ptr);
     }
     else {
-        // prevFree = (int *)GETPREVFREEP(ptr);
-        // nextFree = (int *)GETNEXTFREEP(ptr);
-
-        PUT(HDRP(ptr), PACK(csize, 1));
-        PUT(FTRP(ptr), PACK(csize, 1));
-        removeFreeBlock(ptr);
-        // if ((int *)ptr == freeListStartp){
-        //     freeListStartp = nextFree;
-        // }
-        // if (prevFree){
-        //     PUTNEXTFREEP(prevFree, (long)nextFree);
-        // }
-        // if (nextFree){
-        //     PUTPREVFREEP(nextFree, (long)prevFree);
-        // }
+        /* Used the Entire Block */
+        packagePtr((void *)ptr, csize, 1);
+        
     }
 }
 
+
 /*
  * find_fit - Find a fit for a block with asize bytes
+ * Searches through the each bucket staring with the smallest in which the
+ * requested space will fit. If not free pointers are found the we search the 
+ * next biggest bucket for a free block. We used a first fit search approach
  */
 static void *find_fit(size_t asize)
 {
     /* First fit search */
     void *ptr;
+    int bucketSize;
     if (VERBOSE){
         printf("Called find_Fit for size %d\n",(int)asize);
     }
-    for (ptr = (void *)freeListStartp; ptr; ptr = (void *)GETNEXTFREEP(ptr) ) {
-        if (!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
-            return ptr;
-        }
+
+    bucketSize = getBucketSize(asize);
+    for (int i = bucketSize; i < BUCKETS; i++){
+        for(ptr = ((void **)segListp)[i]; ptr && GET_SIZE(HDRP(ptr));
+            ptr = GETNEXTFREEP(ptr)) {
+            if (asize <= GET_SIZE(HDRP(ptr))){
+                return ptr;
+            }
+        }   
     }
     return NULL;
 }
+/* getBucketSize - We used to determine the bucket size that we want for 
+ *  a requested amount of space. Since the blocks have to be minimum of 24
+ *  blocks we start with a minum block size of 32 and double from that 
+ */
+static int getBucketSize(unsigned int size){
+    size_t check;
+    int bucket= 0;
+    for (int i =5; i < 20 ; i++){
+        check = 1<<i;
+        if  (size<=check){
+            return bucket;
+        }
+        bucket++;
+    }   
+    return bucket + 1;
+}
+/*  ExtendHeap - This is called at the beginning of malloc when there is no 
+ *  heap or when there are no more free blocks with enough space to aloocate
+ *  given amount of space. The ensuing free block that results fro mthis is 
+ *  added to the beginning of the appropriate bucket
+ */
+
 static void *extend_heap(size_t words)
 {
     char *ptr;
@@ -294,164 +323,144 @@ static void *extend_heap(size_t words)
     }
 
     /* Initialize free block header/footer and the epilogue header */
-    PUT(HDRP(ptr), PACK(size, 0));         /* Free block header */
-    PUT(FTRP(ptr), PACK(size, 0));         /* Free block footer */
-    PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); /* New epilogue header */
-    /* Coalesce if the previous block was free */
-    return coalesce(ptr);
+    packagePtr((void *)ptr, size, 0);
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); 
 
+    return putFirstFreeBlock(ptr);
 }
-
+/*  Coalesce - This is used to join adjacent free blocks when putFirstFree
+ *  blockis called. There are 4 cases that may result  
+ *  Case 1 - No adjacent free blocks, 
+ *  Case 2 - next block is free, - remove that block and combine them
+ *  Case 3 - the prev block is free - remove that block from the buckets
+ *  Case 4 - Both adjacent blocks are free, remove both from the buckets 
+ *  Since this is always called in putFirstFreeblock(), then pointer is always 
+ *  added to the buckets with the the free adjacent free blocks
+ */
 static void *coalesce(void *ptr)
 {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     size_t size = GET_SIZE(HDRP(ptr));
-    // int *prevFree, *nextFree;
-    int *freeptr;
+
     if (VERBOSE)
     {
         printf("Called Coalesce on ptr : %p\n", ptr);
     }
     if (prev_alloc && next_alloc) {            /* Case 1 */
-        if (VERBOSE)
-        {
+        if (VERBOSE) {
             printf("Case 1\n");
         }
-        putFirstFreeBlock(ptr);
         return ptr;
     }
 
-    else if (prev_alloc && !next_alloc) {      /* Case 2 */
-        if (VERBOSE)
-        {
+    else if (prev_alloc && !next_alloc) {                     /* Case 2 */
+        if (VERBOSE) {
             printf("Case 2\n");
         }
+        
         size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-        freeptr = (int *)NEXT_BLKP(ptr);
-        removeFreeBlock(freeptr);
-        removeFreeBlock(ptr);
-        PUT(HDRP(ptr), PACK(size, 0));
-        PUT(FTRP(ptr), PACK(size,0));
-        putFirstFreeBlock(ptr);
+        removeFreeBlock(NEXT_BLKP(ptr));
+        packagePtr((void *)ptr, size, 0);
     }
 
-    else if (!prev_alloc && next_alloc) {      /* Case 3 */
-        if (VERBOSE)
-        {
+    else if (next_alloc && !prev_alloc) {                      /* Case 3 */
+        if (VERBOSE) {
             printf("Case 3\n");
         }
+
         size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
-        freeptr = (int *)PREV_BLKP(ptr);
-        removeFreeBlock(ptr);
-        removeFreeBlock(freeptr);
-        ptr = freeptr;
-        PUT(HDRP(ptr), PACK(size, 0));
+        removeFreeBlock(PREV_BLKP(ptr));
+        
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
         PUT(FTRP(ptr), PACK(size, 0));
-        putFirstFreeBlock(ptr);
+        ptr = PREV_BLKP(ptr);
     }
 
     else {                                     /* Case 4 */
-        if (VERBOSE)
-        {
+        if (VERBOSE) {
             printf("Case 4\n");
         }
         size += GET_SIZE(HDRP(PREV_BLKP(ptr))) +
             GET_SIZE(FTRP(NEXT_BLKP(ptr)));
         removeFreeBlock(NEXT_BLKP(ptr));
         removeFreeBlock(PREV_BLKP(ptr));
-        removeFreeBlock(ptr);
+
         PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
         ptr = PREV_BLKP(ptr);
-        putFirstFreeBlock(ptr);
     }
 
     return ptr;
 }
+/*  removeFreeBlock - Removes a block from the buckets, which implies that it
+ *  it is either being merged with another free block or it is being allocated
+ *  Wecheck is it is the the first block in its bucket class and also 
+ *  adjust its prev and next pointers accordingly
+ */
 
 static void removeFreeBlock(void *ptr) {
-    int *prev;
-    int *next;
     if (VERBOSE)
     {
         printf("Entered removeFreeBlock- Removing ptr : %p\n", ptr);
     }
 
-
-    prev = (int *)GETPREVFREEP(ptr);
-    next = (int *)GETNEXTFREEP(ptr);
-    if (prev && !next)
-    {
+    if (GETPREVFREEP(ptr)) {
         //Removing the Last free block
-        PUTNEXTFREEP(prev,(long)0);
+        PUTNEXTFREEP(GETPREVFREEP(ptr),GETNEXTFREEP(ptr));
     }
-    else if (!prev && next)
-    {
+    if (GETNEXTFREEP(ptr)) {
         //Removing the First FREE Block
-        PUTPREVFREEP(next, (long)prev);
-        freeListStartp = next;
-    } else if (prev && next){
-        //Some middle block
-        PUTPREVFREEP(next, (long)prev);
-        PUTNEXTFREEP(prev, (long)next);
-    } else {
-        freeListStartp = 0;
-        freeListEndp = 0;
+        PUTPREVFREEP(GETNEXTFREEP(ptr),GETPREVFREEP(ptr));
+    } 
+
+    int bucketSize = getBucketSize(GET_SIZE(HDRP(ptr)));
+    if (ptr == ((void **)segListp)[bucketSize])
+    {
+        ((void **)segListp)[bucketSize] = GETNEXTFREEP(ptr);
     }
-    // if ((int *)ptr == freeListStartp){
-    //     freeListStartp = next;
-    // }
+    PUTPREVFREEP(ptr, NULL);
+    PUTNEXTFREEP(ptr, NULL);
     return;
 }
+/* putFirstFreeBlock - Takes a newly freed block, or goroup of adjacent
+ * and put it in the front of its corresponding bucket. This always checks if 
+ * there is any adjacent free blocks with Coalesce
+ */
 
-
-static void putFirstFreeBlock(void *ptr){
+static void *putFirstFreeBlock(void *ptr){
     if (VERBOSE)
     {
         printf("Entered putFirstFreeBlock - Inserting ptr: %p ",ptr);
         printf("with Size %d\n",GET_SIZE(HDRP(ptr)));
     }
-    mm_checkheap(404);
+    ptr = coalesce(ptr);
 
-    if (freeListStartp == 0)
-    {
-        freeListStartp = (int *)ptr;
-        freeListEndp = 0;
-        PUTNEXTFREEP(freeListStartp, (long)freeListEndp);
-        PUTPREVFREEP(freeListStartp, 0);
-        return;
-    }
-
-    if ((int *)ptr == freeListStartp)
-    {
-        if (VERBOSE)
-        {
-            printf("No Need to fix\n");
-        }
-        return;
+    void *bucketList = ((void **)segListp)[getBucketSize(GET_SIZE(HDRP(ptr)))];
+    if (!bucketList){
+        PUTNEXTFREEP(ptr, NULL);
+        PUTPREVFREEP(ptr, NULL);
+    } else {
+        PUTNEXTFREEP(ptr, bucketList);
+        PUTPREVFREEP(bucketList, ptr);
+        PUTPREVFREEP(ptr, NULL);
     } 
-    mm_checkheap(423);
-    printf("ptr %p, header %d, footer %d\n",(int *)0x8000044A0, (int)GET(HDRP(0x8000044A0)), (int)GET(FTRP(0x8000044A0)) );
-    PUTPREVFREEP(freeListStartp, (long)ptr);
-    printf("ptr %p, header %d, footer %d\n",(int *)0x8000044A0, (int)GET(HDRP(0x8000044A0)), (int)GET(FTRP(0x8000044A0)) );
-    PUTNEXTFREEP(ptr, (long)freeListStartp);
-    printf("ptr %p, header %d, footer %d\n",(int *)0x8000044A0, (int)GET(HDRP(0x8000044A0)), (int)GET(FTRP(0x8000044A0)) );
-    PUTPREVFREEP(ptr, 0);
-    printf("ptr %p, header %d, footer %d\n",(int *)0x8000044A0, (int)GET(HDRP(0x8000044A0)), (int)GET(FTRP(0x8000044A0)) );
-    freeListStartp = (int *)ptr;
-    mm_checkheap(429);
-    return;
+    ((void **)segListp)[getBucketSize(GET_SIZE(HDRP(ptr)))] = ptr;
+
+    return ptr;
 }
 
 /*
- * realloc - you may want to look at mm-naive.c
+ * realloc - Can be seen as free, malloc depending on its arguments
+ * gets a new allocated block of new size, copies the data and frees the old
+ * block!
  */
 void *realloc(void *ptr, size_t size) {
     size_t oldsize;
     void *newptr;
     if (VERBOSE){
         printf("Called Realloc on ptr %p to size %d\n", ptr, (unsigned int)size);
+        mm_checkheap(417);
     }
 
     /* If size == 0 then this is just free, and we return NULL. */
@@ -484,144 +493,54 @@ void *realloc(void *ptr, size_t size) {
 }
 
 /*
- * calloc - you may want to look at mm-naive.c
- * This function is not tested by mdriver, but it is
- * needed to run the traces.
+ * calloc - Malloc but everythoing is initialzed to 0
  */
 void *calloc (size_t nmemb, size_t size) {
-    return NULL;
-}
-
-
-/*
- * Return whether the pointer is in the heap.
- * May be useful for debugging.
- */
-static int in_heap(const void *p) {
-    return p <= mem_heap_hi() && p >= mem_heap_lo();
+    if (VERBOSE){
+        printf("Called Calloc for %d elements of size %d\n", (int)nmemb, (int)size);
+        mm_checkheap(457);
+    }
+    void *ptr = malloc(nmemb * size);
+    memset(ptr, 0,nmemb*size);
+    return ptr;
 }
 
 /*
- * Return whether the pointer is aligned.
- * May be useful for debugging.
+ * mm_checkheap - Makes sure that the Heap is is properly placed
+ * Calls one helper to check the heap and the another checks the free list
  */
-static int aligned(const void *p) {
-    return (size_t)ALIGN(p) == (size_t)p;
-}
-
-/*
- * mm_checkheap
- */
-void mm_checkheap(int lineno) {
+void mm_checkheap(int lineno) 
+{    
     checkheap(lineno);
     checkFreeList(lineno);
 }
 
-void checkFreeList(int lineno) {
-    
-    int *ptr = freeListStartp;
-
-    if (ptr == 0){
-        if(VERBOSE){
-        printf("No Free list Created yet\n");
-        }
-        return;
-    }
-
-    if (VERBOSE)
-    {
-        printf("Checking Free List .... (%p):\n", freeListStartp);
-    }   
-
-    if (freeListStartp == freeListEndp){
-        if (VERBOSE){
-            printf(" There is no Freelist .. .\n");
-            printf("Passed!!\n");
-        }
-        return;
-    }
-    if (VERBOSE)
-    {
-        printf("CHecking Header Pointer...\n");
-    }
-    if (GET_ALLOC(HDRP(freeListStartp)) || ((int *)GETPREVFREEP(ptr)))
-    {   
-        if (VERBOSE)
-        {
-            printf("Bad free list Start header / alloc and prev \n");
-        }
-        exit(1);
-    }
-
-    checkblock(freeListStartp);
-
-    if(!(int *)GETNEXTFREEP(freeListStartp))
-    {
-        if (VERBOSE)
-        {
-            printf("There is only One free block . . .Passed!!\n");    
-        }
-        return;
-    }
-    if (VERBOSE) {
-       printf("Checking Free list\n");
-    }
-    for (ptr = freeListStartp; (int *)ptr; ptr = (int *)GETNEXTFREEP(ptr)) {
-        if (ptr == (int *)GETNEXTFREEP(ptr)){
-            if (VERBOSE){
-                printf("ERROR Infinite Loop: ptr %p, next:%p, End of List: %p\n",ptr, (int *)GETNEXTFREEP(ptr), (int *)freeListEndp );
-            }
-            exit(1);
-        }
-        if (VERBOSE){
-            printf("ptr: %p, next ptr: %p\n",ptr, (int *)GETNEXTFREEP(ptr) );
-        }
-        if ((GETNEXTFREEP(ptr)) && ((int *)GETPREVFREEP(GETNEXTFREEP(ptr)) != ptr)){
-            if (VERBOSE){
-                printf("next back ptr not correct\n");
-            }
-            exit(1);
-        }
-        checkblock(ptr);
-    }
-    if (VERBOSE)
-    {
-        printf("Done CHecking Free list\n");
-    }
-    
-
-    if (ptr != freeListEndp){
-        if (VERBOSE){
-            printf("Bad Free List End\n");
-        }
-        exit(1);
-    }
-    if (VERBOSE)
-    {
-        printf("Free List Okay!\n");
-    }
-}
-
-
-static void printblock(void *ptr)
+void checkFreeList(int lineno) 
 {
-    size_t hsize, halloc, fsize, falloc;
-
-    // checkheap(0);
-    hsize = GET_SIZE(HDRP(ptr));
-    halloc = GET_ALLOC(HDRP(ptr));
-    fsize = GET_SIZE(FTRP(ptr));
-    falloc = GET_ALLOC(FTRP(ptr));
-
-    if (hsize == 0) {
-    printf("%p: EOL\n", ptr);
-    return;
+    if (VERBOSE)            
+    {   
+        printf("Checking the Free List . . . \n");
     }
-
-      printf("%p: header: [%d:%c] footer: [%d:%c]\n", ptr,
-    (int)hsize, (halloc ? 'a' : 'f'),
-    (int)fsize, (falloc ? 'a' : 'f'));
+    int bucket;
+    void *block;
+    for (bucket = 0; bucket < BUCKETS; bucket++){
+        for (block = ((void **)segListp)[bucket];  block && 
+            (GET_SIZE(HDRP(block))) > 0; block = GETNEXTFREEP(block)) 
+        {
+            printf("block %p, next%p\n", block, GETNEXTFREEP(block));
+            if (GETNEXTFREEP(block) && GETPREVFREEP(GETNEXTFREEP(block)) != block){
+                printf("Error prev and nex pointers\n");
+                exit(1);
+            }
+            if (getBucketSize(GET_SIZE(HDRP(block))) != bucket){
+                printf("Block %p is in the wront bucket\n", block);
+                exit(1);
+            }
+        }
+    }    
 }
+
+
 
 static void checkblock(void *ptr)
 {
@@ -637,7 +556,7 @@ static void checkblock(void *ptr)
 }
 
 /*
- * checkheap - Minimal check of the heap for consistency
+ * checkheap - Boss check of the heap for consistency
  */
 void checkheap(int lineno)
 {
@@ -678,15 +597,12 @@ void checkheap(int lineno)
     printf("Passed\n");
     }
 
-    // if (verbose)
-    //    printblock(ptr);
     if ((GET_SIZE(HDRP(ptr)) != 0) || !(GET_ALLOC(HDRP(ptr)))){
         if (VERBOSE)
         {
             printf("Bad epilogue header\n");       
         }
-        // exit(1);
+        exit(1);
    }
    return;
 }
-
